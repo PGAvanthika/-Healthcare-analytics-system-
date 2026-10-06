@@ -23,40 +23,48 @@ from config import (
 )
 
 # ---------------------------------------------------------------------------
-# Shared theme
+# Shared theme  — healthcare palette
 # ---------------------------------------------------------------------------
+# Tokens mirror the design constants in app.py so charts match the UI.
+_C_BG      = "#FFFFFF"   # white chart background
+_C_GRID    = "#EEF2F7"   # subtle grid lines
+_C_AXIS    = "#64748B"   # axis line colour
+_C_TEXT    = "#17324D"   # axis label / annotation text
+_C_TITLE   = "#123B5D"   # chart title
 
 # Base Plotly layout applied to every chart for visual consistency.
 _BASE_LAYOUT = dict(
-    paper_bgcolor="#f8fbff",
-    plot_bgcolor="#f8fbff",
-    font=dict(family="sans-serif", size=12, color="#2c3e50"),
-    title_font=dict(size=14, color="#1a5276", family="sans-serif"),
+    paper_bgcolor=_C_BG,
+    plot_bgcolor=_C_BG,
+    font=dict(family="'Segoe UI', sans-serif", size=12, color=_C_TEXT),
+    title_font=dict(size=14, color=_C_TITLE, family="'Segoe UI', sans-serif"),
     margin=dict(l=40, r=20, t=50, b=40),
     hoverlabel=dict(
-        bgcolor="#ffffff",
+        bgcolor="#FFFFFF",
         font_size=12,
-        font_family="sans-serif",
+        font_family="'Segoe UI', sans-serif",
+        bordercolor="#D9E2EC",
     ),
     legend=dict(
         bgcolor="rgba(0,0,0,0)",
         bordercolor="rgba(0,0,0,0)",
+        font=dict(size=11, color=_C_TEXT),
     ),
 )
 
-# Colour sequences
-_DONUT_COLOURS = ["#2e86c1", "#aed6f1"]
-_BAR_COLOUR    = "#2e86c1"
+# Colour tokens
+_DONUT_COLOURS = ["#123B5D", "#2A9D8F"]   # primary + accent
+_BAR_COLOUR    = "#0F766E"                 # teal
 _STATUS_COLOURS = {
-    "Normal":    "#27ae60",
-    "Discharge": "#2e86c1",
-    "Readmit":   "#f39c12",
-    "ICU":       "#e67e22",
-    "Death":     "#c0392b",
+    "Normal":    "#0F766E",   # teal
+    "Discharge": "#2A9D8F",   # accent
+    "Readmit":   "#E2A03F",   # amber
+    "ICU":       "#D97706",   # orange
+    "Death":     "#B91C1C",   # red
 }
-_DEPT_COLOUR   = "#2980b9"
-_LINE_COLOUR   = "#1a5276"
-_AGE_COLOUR    = "#2e86c1"
+_DEPT_COLOUR = "#123B5D"   # primary
+_LINE_COLOUR = "#0F766E"   # teal
+_AGE_COLOUR  = "#2A9D8F"   # accent
 
 # Logical age-bucket order (not alphabetical)
 _AGE_ORDER = ["Below 6Y", "6-20Y", "21-40Y", "41-60y", "60+Y"]
@@ -144,8 +152,11 @@ def plot_status_distribution(df: pd.DataFrame) -> go.Figure:
     fig.update_layout(
         **_BASE_LAYOUT,
         title_text="Patient Status Distribution",
-        xaxis=dict(title="Status", showgrid=False, linecolor="#d5e8fb"),
-        yaxis=dict(title="Patient Count", showgrid=True, gridcolor="#e8f4fd", linecolor="#d5e8fb"),
+        xaxis=dict(title="Status", showgrid=False, linecolor=_C_AXIS,
+                   tickfont=dict(color=_C_TEXT), title_font=dict(color=_C_TEXT)),
+        yaxis=dict(title="Patient Count", showgrid=True, gridcolor=_C_GRID,
+                   linecolor=_C_AXIS, tickfont=dict(color=_C_TEXT),
+                   title_font=dict(color=_C_TEXT)),
     )
     return fig
 
@@ -198,8 +209,11 @@ def plot_department_distribution(df: pd.DataFrame) -> go.Figure:
     fig.update_layout(
         **dept_layout,
         title_text="Patients by Department",
-        xaxis=dict(title="Patient Count", showgrid=True, gridcolor="#e8f4fd", linecolor="#d5e8fb"),
-        yaxis=dict(title="", showgrid=False, linecolor="#d5e8fb", automargin=True),
+        xaxis=dict(title="Patient Count", showgrid=True, gridcolor=_C_GRID,
+                   linecolor=_C_AXIS, tickfont=dict(color=_C_TEXT),
+                   title_font=dict(color=_C_TEXT)),
+        yaxis=dict(title="", showgrid=False, linecolor=_C_AXIS,
+                   tickfont=dict(color=_C_TEXT), automargin=True),
         height=chart_height,
         margin=dict(l=10, r=60, t=50, b=40),
     )
@@ -246,7 +260,7 @@ def plot_monthly_patient_volume(df: pd.DataFrame) -> go.Figure:
             line=dict(color=_LINE_COLOUR, width=2.5),
             marker=dict(color=_LINE_COLOUR, size=7, symbol="circle"),
             fill="tozeroy",
-            fillcolor="rgba(46,134,193,0.1)",
+            fillcolor="rgba(15,118,110,0.08)",
             hovertemplate="<b>%{x}</b><br>Patients: %{y:,}<extra></extra>",
         )
     )
@@ -254,14 +268,13 @@ def plot_monthly_patient_volume(df: pd.DataFrame) -> go.Figure:
         **_BASE_LAYOUT,
         title_text="Monthly Patient Volume",
         xaxis=dict(
-            title="Month",
-            showgrid=False,
-            linecolor="#d5e8fb",
-            tickangle=-30,
-            # Preserve data order — do not sort alphabetically
-            categoryorder="trace",
+            title="Month", showgrid=False, linecolor=_C_AXIS,
+            tickangle=-30, categoryorder="trace",
+            tickfont=dict(color=_C_TEXT), title_font=dict(color=_C_TEXT),
         ),
-        yaxis=dict(title="Patient Count", showgrid=True, gridcolor="#e8f4fd", linecolor="#d5e8fb"),
+        yaxis=dict(title="Patient Count", showgrid=True, gridcolor=_C_GRID,
+                   linecolor=_C_AXIS, tickfont=dict(color=_C_TEXT),
+                   title_font=dict(color=_C_TEXT)),
     )
     return fig
 
@@ -307,8 +320,11 @@ def plot_age_distribution(df: pd.DataFrame) -> go.Figure:
     fig.update_layout(
         **_BASE_LAYOUT,
         title_text="Patient Age Distribution",
-        xaxis=dict(title="Age Group", showgrid=False, linecolor="#d5e8fb"),
-        yaxis=dict(title="Patient Count", showgrid=True, gridcolor="#e8f4fd", linecolor="#d5e8fb"),
+        xaxis=dict(title="Age Group", showgrid=False, linecolor=_C_AXIS,
+                   tickfont=dict(color=_C_TEXT), title_font=dict(color=_C_TEXT)),
+        yaxis=dict(title="Patient Count", showgrid=True, gridcolor=_C_GRID,
+                   linecolor=_C_AXIS, tickfont=dict(color=_C_TEXT),
+                   title_font=dict(color=_C_TEXT)),
     )
     return fig
 
