@@ -1191,11 +1191,7 @@ elif selected_page == NAV_ITEMS[4]:
         phase="Phase 4",
         features=[
             "Expected LOS prediction",
-            "Readmission risk scoring",
-            "Bed demand forecasting",
-            "Treatment cost estimation",
-            "Patient outcome probability",
-            "Seasonal admission forecasting",
+            "Bed demand forecasting"
         ],
     )
 
