@@ -55,6 +55,13 @@ from utils.preprocessing import (
     QualityReport,
 )
 from utils.metrics import calculate_kpis, KPIResult
+from utils.descriptive import (
+    plot_patient_type_distribution,
+    plot_status_distribution,
+    plot_department_distribution,
+    plot_monthly_patient_volume,
+    plot_age_distribution,
+)
 
 # =============================================================================
 # Page configuration — must be the first Streamlit call
@@ -490,7 +497,59 @@ r4c1.metric("Avg Patient Rating", f"{kpis.avg_rating} / 5.0")
 st.divider()
 
 # =============================================================================
-# SECTION 3 — Data Quality
+# SECTION 3 — Patient Overview Charts
+# =============================================================================
+# All five charts receive the same filtered_df used by the KPI engine.
+# No independent data loading or filtering takes place here.
+# =============================================================================
+
+_header("Patient Overview")
+
+if len(filtered_df) == 0:
+    st.warning("No records match the current filters. Adjust the sidebar filters to see charts.")
+else:
+    # ---- Row 1 : Patient Type  |  Status Distribution ----
+    ch1, ch2 = st.columns(2)
+    with ch1:
+        st.plotly_chart(
+            plot_patient_type_distribution(filtered_df),
+            use_container_width=True,
+        )
+    with ch2:
+        st.plotly_chart(
+            plot_status_distribution(filtered_df),
+            use_container_width=True,
+        )
+
+    st.markdown("")
+
+    # ---- Row 2 : Department  |  Monthly Volume ----
+    ch3, ch4 = st.columns(2)
+    with ch3:
+        st.plotly_chart(
+            plot_department_distribution(filtered_df),
+            use_container_width=True,
+        )
+    with ch4:
+        st.plotly_chart(
+            plot_monthly_patient_volume(filtered_df),
+            use_container_width=True,
+        )
+
+    st.markdown("")
+
+    # ---- Row 3 : Age Distribution (half-width, left-aligned) ----
+    ch5, _ = st.columns(2)
+    with ch5:
+        st.plotly_chart(
+            plot_age_distribution(filtered_df),
+            use_container_width=True,
+        )
+
+st.divider()
+
+# =============================================================================
+# SECTION 4 — Data Quality
 # =============================================================================
 
 _header("Data Quality")
