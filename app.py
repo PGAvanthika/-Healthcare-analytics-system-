@@ -109,6 +109,17 @@ from utils.predictive import (
     plot_los_distribution_by_type,
     MIN_GROUP_RECORDS,
     AGE_ORDER,
+    # Feature 2 — Bed Demand Forecasting
+    validate_date_semantics,
+    build_weekly_inpatient_series,
+    run_ses_forecast,
+    estimate_bed_demand,
+    department_bed_demand_table,
+    plot_ses_forecast,
+    plot_bed_demand_bar,
+    plot_holdout_validation,
+    INPATIENT_VALUE,
+    MIN_SERIES_OBS,
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1393,41 +1404,248 @@ def render_predictive_analytics():
         )
 
     # ──────────────────────────────────────────────────────────
-    # SECTION 5 — Bed Demand Forecasting placeholder
+    # SECTION 5 — Bed Demand Forecasting  (Feature 2)
     # ──────────────────────────────────────────────────────────
     st.markdown(
-        f'<div style="background:#94A3B8; color:#FFFFFF; border-radius:8px; '
+        f'<div style="background:{C_PRIMARY}; color:#FFFFFF; border-radius:8px; '
         f'padding:0.55rem 1rem; font-size:0.82rem; font-weight:700; '
-        f'letter-spacing:0.06em; margin:2rem 0 0.9rem 0;">'
-        f'5 &nbsp;·&nbsp; BED DEMAND FORECASTING &nbsp;— COMING SOON'
+        f'letter-spacing:0.06em; margin:2.2rem 0 0.9rem 0;">'
+        f'5 &nbsp;·&nbsp; BED DEMAND FORECASTING'
         f'</div>',
         unsafe_allow_html=True,
     )
     st.markdown(
-        f'<div style="background:{C_CARD}; border:1px dashed {C_BORDER}; '
-        f'border-radius:10px; padding:2rem; text-align:center;">'
-        f'<div style="font-size:2rem; margin-bottom:0.5rem;">🛏</div>'
-        f'<p style="font-size:1rem; font-weight:700; color:{C_PRIMARY}; margin:0 0 0.3rem 0;">'
-        f'Bed Demand Forecasting</p>'
-        f'<p style="font-size:0.85rem; color:{C_SUBTEXT}; margin:0;">'
-        f'Planned feature — will model expected bed occupancy using admission '
-        f'patterns and predicted LOS from historical records.</p>'
-        f'</div>',
+        f'<p style="font-size:0.85rem; color:{C_SUBTEXT}; margin:0 0 0.6rem 0;">'
+        f'Forecast future inpatient arrivals and estimate average bed requirements '
+        f'using historical admission patterns and expected length of stay.</p>',
         unsafe_allow_html=True,
     )
 
-    # ──────────────────────────────────────────────────────────
-    # Footer methodology note
-    # ──────────────────────────────────────────────────────────
+    # ── Validate date semantics ───────────────────────────────
+    date_check = validate_date_semantics(filtered_df)
+    if not date_check["valid"]:
+        st.error(
+            "Date column validation failed — arrival forecasting cannot proceed. "
+            + " ".join(date_check["notes"])
+        )
+    else:
+        # Show validation notes in a subtle info block
+        with st.expander("📅 Date semantics validation", expanded=False):
+            for note in date_check["notes"]:
+                st.markdown(
+                    f'<p style="font-size:0.78rem; color:{C_SUBTEXT}; margin:0.1rem 0;">• {note}</p>',
+                    unsafe_allow_html=True,
+                )
+
+    # ── Forecast controls ─────────────────────────────────────
+    _section("Forecast Controls")
+    fc1, fc2, fc3 = st.columns(3)
+    with fc1:
+        horizon_weeks = st.selectbox(
+            "Forecast horizon",
+            options=[2, 4, 8, 12],
+            index=1,
+            format_func=lambda w: f"{w} weeks ({w*7} days)",
+            key="bed_horizon",
+        )
+    with fc2:
+        bed_dept_opts = ["All Departments"] + sorted(
+            filtered_df[COL_DEPT_NAME].dropna().unique().tolist()
+        ) if COL_DEPT_NAME in filtered_df.columns else ["All Departments"]
+        bed_dept = st.selectbox(
+            "Department (inpatients only)",
+            options=bed_dept_opts,
+            index=0,
+            key="bed_dept",
+        )
+    with fc3:
+        st.markdown(
+            f'<div style="background:{C_ACTIVE_BG}; border:1px solid {C_BORDER}; '
+            f'border-radius:8px; padding:0.6rem 0.9rem; margin-top:1.6rem; '
+            f'font-size:0.78rem; color:{C_SUBTEXT};">'
+            f'Historical period follows the <strong>global Date Range</strong> filter above.'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+    bed_dept_val = None if bed_dept == "All Departments" else bed_dept
+    dept_label   = bed_dept if bed_dept_val else "All Departments"
+
+    # ── Run SES ───────────────────────────────────────────────
+    ses_result = run_ses_forecast(
+        filtered_df,
+        department=bed_dept_val,
+        horizon_weeks=horizon_weeks,
+    )
+
+    # ── Expected LOS for the selected group ──────────────────
+    los_est = estimate_los(filtered_df, bed_dept_val, INPATIENT_VALUE, None)
+
+    if not ses_result["success"]:
+        st.warning(f"**Forecast unavailable:** {ses_result['reason']}")
+    else:
+        # ── Bed demand calculation ────────────────────────────
+        bd_result = estimate_bed_demand(
+            ses_result["forecast_daily"],
+            los_est["expected_los"] if not los_est["no_data"] else 0.0,
+        )
+
+        # ── KPI cards ─────────────────────────────────────────
+        _section("Forecast Summary")
+        bk1, bk2, bk3, bk4 = st.columns(4)
+        bk1.metric(
+            "Forecast Inpatients / Week",
+            f"{ses_result['forecast_weekly']:.1f}",
+            help="SES point forecast for each week in the horizon (constant for SES).",
+        )
+        bk2.metric(
+            "Forecast Inpatients / Day",
+            f"{ses_result['forecast_daily']:.2f}",
+            help="Weekly forecast ÷ 7.",
+        )
+        bk3.metric(
+            "Expected LOS (Inpatient)",
+            f"{los_est['expected_los']:.1f} days"
+            if not los_est["no_data"] else "N/A",
+            help=f"Median LOS from Feature 1 — grouping: {los_est['level']}.",
+        )
+        bk4.metric(
+            "Avg Bed Demand (estimated)",
+            f"{bd_result['avg_bed_demand']:.1f} beds"
+            if bd_result["valid"] else "N/A",
+            help="Forecast daily arrivals × Expected LOS (steady-flow approximation).",
+        )
+
+        # Bed demand formula display
+        if bd_result["valid"]:
+            st.markdown(
+                f'<div style="background:{C_ACTIVE_BG}; border-left:3px solid {C_TEAL}; '
+                f'border-radius:4px; padding:0.45rem 0.85rem; font-size:0.8rem; '
+                f'color:{C_TEXT}; margin:0.3rem 0 0.6rem 0;">'
+                f'<strong>Formula:</strong> {bd_result["formula"]}'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
+        elif not los_est["no_data"] is False:
+            st.warning(
+                "Expected LOS is unavailable for this group — bed demand cannot be estimated. "
+                "The arrival forecast is still shown below."
+            )
+
+        # Model parameters
+        st.markdown(
+            f'<div style="font-size:0.76rem; color:{C_SUBTEXT}; margin-bottom:0.8rem;">'
+            f'SES alpha (optimised): <strong>{ses_result["alpha"]:.2f}</strong> &nbsp;·&nbsp; '
+            f'Holdout RMSE: <strong>{ses_result["holdout_rmse"]:.2f} inpatients/week</strong> '
+            f'(last {ses_result["holdout_n"]} weeks) &nbsp;·&nbsp; '
+            f'Historical observations: <strong>{ses_result["n_obs"]} weeks</strong>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+        # ── Row 1: Forecast chart + Holdout validation ────────
+        _section("Historical Arrivals & Forecast")
+        fc_c1, fc_c2 = st.columns([0.60, 0.40])
+        with fc_c1:
+            st.plotly_chart(
+                plot_ses_forecast(ses_result, horizon_weeks, dept_label),
+                use_container_width=True,
+            )
+        with fc_c2:
+            st.plotly_chart(
+                plot_holdout_validation(ses_result),
+                use_container_width=True,
+            )
+
+        # ── Row 2: Department bed demand comparison ───────────
+        _section("Department Bed Demand Comparison")
+        st.caption(
+            "Departments with fewer than "
+            f"{MIN_SERIES_OBS} weekly inpatient observations are excluded."
+        )
+        dept_bd_table = department_bed_demand_table(
+            filtered_df, horizon_weeks=horizon_weeks
+        )
+        if not dept_bd_table.empty:
+            bd_c1, bd_c2 = st.columns(2)
+            with bd_c1:
+                st.plotly_chart(
+                    plot_bed_demand_bar(dept_bd_table),
+                    use_container_width=True,
+                )
+            with bd_c2:
+                # Department table
+                disp = dept_bd_table.copy()
+                disp["Forecast_Daily"] = disp["Forecast_Daily"].apply(
+                    lambda v: f"{v:.3f}" if pd.notna(v) else "—"
+                )
+                disp["Expected_LOS"] = disp["Expected_LOS"].apply(
+                    lambda v: f"{v:.1f} d" if pd.notna(v) else "—"
+                )
+                disp["Avg_Bed_Demand"] = disp["Avg_Bed_Demand"].apply(
+                    lambda v: f"{v:.1f}" if pd.notna(v) else "Insuff. data"
+                )
+                disp = disp.rename(columns={
+                    "Forecast_Daily": "Fcst/Day",
+                    "Expected_LOS":  "Exp LOS",
+                    "Avg_Bed_Demand": "Avg Beds",
+                    "Sufficient_Data": "Sufficient?",
+                })
+                st.dataframe(
+                    disp[["Department", "Records", "Fcst/Day",
+                           "Exp LOS", "Avg Beds"]],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+        else:
+            st.info("No department-level data available for the current filter.")
+
+    # ── Methodology & limitations ─────────────────────────────
+    with st.expander("Methodology & Limitations", expanded=False):
+        st.markdown(
+            f"""
+**Simple Exponential Smoothing (SES)**
+
+S(t) = α × Y(t) + (1 − α) × S(t−1)
+
+- **Y(t)** — observed weekly inpatient arrivals for period t
+- **S(t−1)** — previous smoothed level
+- **α** — smoothing parameter, optimised by minimising holdout MSE on the
+  last ~20% of historical weeks (no future leakage)
+- All h-step-ahead SES forecasts equal the last smoothed level (flat/constant)
+- SES does not model trend or seasonality — stated limitation
+
+**Bed demand approximation (steady-flow)**
+
+Average Bed Demand ≈ Forecast Daily Arrivals × Expected LOS (days)
+
+Valid when admission and discharge rates are in approximate steady state.
+Represents **average** occupancy, not daily peak or guaranteed capacity.
+
+**Data notes**
+
+- Date confirmed as admission/encounter date: each patient has a unique
+  (patient_id, date) pair across {len(processed_df):,} records
+- Only `{INPATIENT_VALUE}` records contribute to arrival counts
+- Weekly aggregation used (52 observations in full dataset, 0 zero-weeks)
+- Expected LOS reused from Feature 1 (historical median, same filters)
+
+**Limitations**
+
+- Single year of data (2007): seasonal patterns cannot be validated
+- High week-to-week variance (CV ≈ 1.1): SES uncertainty is material
+- No operational bed capacity data in the workbook — occupancy % not shown
+- Forecast is a statistical baseline, not a guaranteed future outcome
+            """.strip()
+        )
+
+    # ── Footer methodology note ───────────────────────────────
     st.markdown(
         f'<p style="font-size:0.75rem; color:{C_SUBTEXT}; margin-top:1.8rem; '
         f'border-top:1px solid {C_BORDER}; padding-top:0.6rem;">'
-        f'<strong>Methodology:</strong> Expected LOS is estimated using the historical '
-        f'median length of stay for comparable patient groups. '
-        f'The median is less affected by unusually long stays than the mean. '
-        f'This is a historical baseline estimate, not a validated individual-patient '
-        f'prediction. No machine-learning model was trained. '
-        f'Source data: <code>{os.path.basename(DATA_PATH)}</code>. '
+        f'<strong>Methodology:</strong> SES arrival forecast combined with historical '
+        f'median Expected LOS (Feature 1) via steady-flow approximation. '
+        f'No ML model trained. Source: <code>{os.path.basename(DATA_PATH)}</code>. '
         f'Original file is never modified.'
         f'</p>',
         unsafe_allow_html=True,
@@ -1489,7 +1707,7 @@ elif selected_page == NAV_ITEMS[4]:
 st.markdown(f'<hr style="border:none; border-top:1px solid {C_BORDER}; margin:2rem 0 0.5rem 0;">', unsafe_allow_html=True)
 st.markdown(
     f'<p style="font-size:0.72rem; color:{C_SUBTEXT}; text-align:center;">'
-    f'MediSight · Phase 1 + Phase 2 + Phase 3 · Data: <code>{os.path.basename(DATA_PATH)}</code> · '
+    f'MediSight · Phase 1 + Phase 2 + Phase 3 (LOS + Bed Demand) · Data: <code>{os.path.basename(DATA_PATH)}</code> · '
     f'No data generated, modified, or written back to source.'
     f'</p>',
     unsafe_allow_html=True,

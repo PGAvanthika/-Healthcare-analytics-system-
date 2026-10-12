@@ -456,3 +456,652 @@ def plot_los_distribution_by_type(df: pd.DataFrame) -> go.Figure:
         yaxis=dict(**_GRID_AXIS, title="Number of Patients"),
     )
     return fig
+
+
+# =============================================================================
+# Feature 2 — Bed Demand Forecasting
+# =============================================================================
+# Method: Simple Exponential Smoothing (SES) on weekly inpatient arrivals,
+#         combined with Feature 1 Expected LOS to estimate average bed demand.
+#
+# SES equation: S(t) = alpha × Y(t) + (1 − alpha) × S(t−1)
+#   Y(t)     = observed inpatient count for period t
+#   S(t−1)   = previous smoothed value
+#   alpha    = smoothing parameter (0, 1]  — higher alpha → more weight on recent obs
+#
+# Alpha selection: grid search over [0.05, 0.95] step 0.05,
+#   minimising MSE on the last ~20% of historical observations (chronological
+#   holdout).  Future observations are never used to select alpha.
+#
+# Granularity: weekly aggregation.
+#   Daily series has CV=1.71 and 4.4% zeros → noisier.
+#   Weekly series has 52 observations, CV=1.12, 0 zero-weeks → better for SES.
+#
+# Bed demand approximation (steady-flow):
+#   Average Beds ≈ Forecast_Daily_Arrivals × Expected_LOS_Days
+#   This is valid when admission and discharge flows are reasonably stable.
+#   It estimates *average* occupancy, not a daily peak or guaranteed capacity.
+#
+# Date semantics: confirmed — each patient row has a unique (ID, Date) pair;
+#   multiple patients share the same calendar date, consistent with Date
+#   being an admission/encounter date.
+# =============================================================================
+
+from config import COL_DATE, COL_LOS, COL_DEPT_NAME, COL_PATIENT_TYPE
+INPATIENT_VALUE = "Inpatient"   # exact value in Patient type column
+MIN_SERIES_OBS  = 8             # minimum weekly obs required to run SES
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SES implementation (no external dependency on statsmodels)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _ses_smooth(series: np.ndarray, alpha: float) -> np.ndarray:
+    """
+    Apply Simple Exponential Smoothing to a 1-D array.
+
+    S(0) = Y(0)
+    S(t) = alpha × Y(t) + (1 − alpha) × S(t−1)
+
+    Parameters
+    ----------
+    series : array of observed values (chronological)
+    alpha  : smoothing parameter (0 < alpha ≤ 1)
+
+    Returns
+    -------
+    np.ndarray of smoothed values, same length as series
+    """
+    n = len(series)
+    s = np.empty(n)
+    s[0] = series[0]
+    for t in range(1, n):
+        s[t] = alpha * series[t] + (1.0 - alpha) * s[t - 1]
+    return s
+
+
+def _ses_forecast(series: np.ndarray, alpha: float, horizon: int) -> np.ndarray:
+    """
+    Fit SES on the full series and project h steps ahead.
+
+    For SES, all h-step-ahead forecasts equal the last smoothed value
+    (the forecast function is flat/constant beyond the training window).
+
+    Returns
+    -------
+    np.ndarray of length `horizon` — all values = last smoothed value
+    """
+    smoothed   = _ses_smooth(series, alpha)
+    last_level = smoothed[-1]
+    return np.full(horizon, last_level)
+
+
+def _find_best_alpha(
+    series: np.ndarray,
+    alphas: np.ndarray | None = None,
+) -> tuple[float, float, float]:
+    """
+    Grid-search for the alpha that minimises holdout MSE.
+
+    Holdout = last max(4, n//5) observations (~20%).
+    Alpha is chosen on the *training* portion only — no future leakage.
+
+    Returns
+    -------
+    (best_alpha, holdout_mse, holdout_rmse)
+    """
+    if alphas is None:
+        alphas = np.round(np.arange(0.05, 1.00, 0.05), 2)
+
+    n         = len(series)
+    hold_n    = max(4, n // 5)
+    train     = series[: n - hold_n]
+    test      = series[n - hold_n :]
+
+    best_alpha = 0.3
+    best_mse   = np.inf
+
+    for alpha in alphas:
+        fitted   = _ses_smooth(train, alpha)
+        forecast = np.full(hold_n, fitted[-1])   # constant forecast
+        mse      = float(np.mean((test - forecast) ** 2))
+        if mse < best_mse:
+            best_mse   = mse
+            best_alpha = float(alpha)
+
+    return best_alpha, best_mse, float(np.sqrt(best_mse))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Data preparation
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_weekly_inpatient_series(
+    df: pd.DataFrame,
+    department: str | None = None,
+) -> pd.DataFrame:
+    """
+    Aggregate inpatient records into a weekly time series.
+
+    Steps
+    -----
+    1. Select inpatient rows only (Patient type == 'Inpatient').
+    2. Optionally filter to a single department.
+    3. Group by (Year, Week) and count records.
+    4. Sort chronologically.
+
+    Uses the existing `Year` and `Week` derived columns added by the
+    preprocessing pipeline.  Falls back to computing them if absent.
+
+    Parameters
+    ----------
+    df         : processed (filtered) patient DataFrame
+    department : if provided, restrict to that department
+
+    Returns
+    -------
+    DataFrame with columns: Year, Week, Count — sorted chronologically.
+    Returns empty DataFrame if insufficient inpatient records.
+    """
+    if COL_DATE not in df.columns or COL_PATIENT_TYPE not in df.columns:
+        return pd.DataFrame()
+
+    # Inpatient filter
+    inp = df[df[COL_PATIENT_TYPE] == INPATIENT_VALUE].copy()
+
+    # Department filter
+    if department and COL_DEPT_NAME in inp.columns:
+        inp = inp[inp[COL_DEPT_NAME] == department]
+
+    if len(inp) == 0:
+        return pd.DataFrame()
+
+    # Ensure Year / Week columns exist
+    if "Year" not in inp.columns:
+        inp["Year"] = inp[COL_DATE].dt.year
+    if "Week" not in inp.columns:
+        inp["Week"] = inp[COL_DATE].dt.isocalendar().week.astype(int)
+
+    weekly = (
+        inp.groupby(["Year", "Week"])
+        .size()
+        .reset_index(name="Count")
+        .sort_values(["Year", "Week"])
+        .reset_index(drop=True)
+    )
+    return weekly
+
+
+def validate_date_semantics(df: pd.DataFrame) -> dict:
+    """
+    Confirm that the Date column behaves like an admission/encounter date.
+
+    Checks performed:
+    - Column exists and is datetime
+    - Zero nulls
+    - Each (patient_id, date) pair is unique — patients are not double-counted
+    - Multiple patients share the same date (i.e. it is not a single event date)
+
+    Returns a dict with keys: valid (bool), notes (list[str])
+    """
+    from config import COL_PATIENT_ID
+    notes = []
+    valid = True
+
+    if COL_DATE not in df.columns:
+        return {"valid": False, "notes": ["Date column not found."]}
+
+    if not pd.api.types.is_datetime64_any_dtype(df[COL_DATE]):
+        valid = False
+        notes.append("Date column is not datetime type.")
+
+    null_count = int(df[COL_DATE].isna().sum())
+    if null_count:
+        notes.append(f"{null_count} null Date values found.")
+
+    if COL_PATIENT_ID in df.columns:
+        dupes = df.groupby([COL_PATIENT_ID, COL_DATE]).size()
+        multi = int((dupes > 1).sum())
+        if multi:
+            valid = False
+            notes.append(
+                f"{multi} (patient_id, date) pairs appear more than once — "
+                "Date may not be a unique admission date."
+            )
+        else:
+            notes.append(
+                "Each (patient_id, date) pair is unique — consistent with "
+                "Date representing an admission or encounter date."
+            )
+
+    patients_per_date = df.groupby(COL_DATE).size()
+    if patients_per_date.max() > 1:
+        notes.append(
+            f"Multiple patients share the same date (max {patients_per_date.max()} "
+            "per day) — Date is a calendar date, not a single event."
+        )
+
+    unique_dates = int(df[COL_DATE].nunique())
+    notes.append(
+        f"Date range: {df[COL_DATE].min().date()} → {df[COL_DATE].max().date()} "
+        f"({unique_dates} unique dates across {len(df):,} records)."
+    )
+    return {"valid": valid, "notes": notes}
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Forecasting engine
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_ses_forecast(
+    df: pd.DataFrame,
+    department: str | None = None,
+    horizon_weeks: int = 4,
+) -> dict:
+    """
+    Full SES forecasting pipeline for inpatient weekly arrivals.
+
+    Parameters
+    ----------
+    df             : processed (filtered) patient DataFrame
+    department     : restrict to a single department if provided
+    horizon_weeks  : number of weeks to forecast ahead
+
+    Returns
+    -------
+    dict with keys:
+        success          bool
+        reason           str   — failure message when success=False
+        weekly_df        DataFrame — historical weekly series
+        alpha            float — optimised smoothing parameter
+        holdout_rmse     float — RMSE on validation holdout
+        holdout_n        int   — number of holdout weeks
+        smoothed         np.ndarray — SES fitted values (in-sample)
+        forecast         np.ndarray — forecast values (length = horizon_weeks)
+        forecast_weekly  float — the forecast value per week (constant for SES)
+        forecast_daily   float — forecast_weekly / 7
+        n_obs            int   — number of historical weekly observations
+    """
+    weekly_df = build_weekly_inpatient_series(df, department)
+
+    if weekly_df.empty or len(weekly_df) < MIN_SERIES_OBS:
+        n = len(weekly_df)
+        return {
+            "success": False,
+            "reason": (
+                f"Insufficient inpatient data: {n} weekly observation(s) found "
+                f"(minimum required: {MIN_SERIES_OBS}). "
+                "Try a broader date range or department selection."
+            ),
+        }
+
+    series = weekly_df["Count"].values.astype(float)
+    alpha, hold_mse, hold_rmse = _find_best_alpha(series)
+    smoothed = _ses_smooth(series, alpha)
+    forecast = _ses_forecast(series, alpha, horizon_weeks)
+
+    hold_n = max(4, len(series) // 5)
+
+    return {
+        "success":         True,
+        "reason":          "",
+        "weekly_df":       weekly_df,
+        "alpha":           alpha,
+        "holdout_rmse":    round(hold_rmse, 2),
+        "holdout_n":       hold_n,
+        "smoothed":        smoothed,
+        "forecast":        forecast,
+        "forecast_weekly": round(float(forecast[0]), 2),
+        "forecast_daily":  round(float(forecast[0]) / 7.0, 4),
+        "n_obs":           len(series),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Bed demand calculation
+# ─────────────────────────────────────────────────────────────────────────────
+
+def estimate_bed_demand(
+    forecast_daily: float,
+    expected_los: float,
+) -> dict:
+    """
+    Estimate average occupied beds using the steady-flow approximation.
+
+    Formula:
+        Average Bed Demand ≈ Forecast Daily Arrivals × Expected LOS (days)
+
+    This is valid when admission and discharge rates are in approximate
+    steady state. It represents average concurrent occupancy, NOT peak
+    occupancy or exact daily census.
+
+    Parameters
+    ----------
+    forecast_daily : daily inpatient arrivals from SES forecast
+    expected_los   : historical median LOS for the relevant group
+
+    Returns
+    -------
+    dict:
+        avg_bed_demand   float — estimated average beds occupied
+        formula          str   — human-readable formula used
+        valid            bool  — False if either input is zero or negative
+    """
+    if forecast_daily <= 0 or expected_los <= 0:
+        return {
+            "avg_bed_demand": 0.0,
+            "formula":        "N/A (zero or negative input)",
+            "valid":          False,
+        }
+
+    avg_beds = round(forecast_daily * expected_los, 2)
+    formula  = (
+        f"{forecast_daily:.3f} arrivals/day × {expected_los:.2f} days LOS "
+        f"= {avg_beds:.1f} beds"
+    )
+    return {
+        "avg_bed_demand": avg_beds,
+        "formula":        formula,
+        "valid":          True,
+    }
+
+
+def department_bed_demand_table(
+    df: pd.DataFrame,
+    horizon_weeks: int = 4,
+) -> pd.DataFrame:
+    """
+    Build a department-level bed demand comparison table.
+
+    For each department with sufficient inpatient data:
+    - Run SES to get forecast_daily
+    - Fetch median Expected LOS via estimate_los
+    - Compute estimated average bed demand
+
+    Returns DataFrame with columns:
+        Department, Records, Forecast_Daily, Expected_LOS, Avg_Bed_Demand,
+        Sufficient_Data (bool)
+    """
+    if COL_DEPT_NAME not in df.columns:
+        return pd.DataFrame()
+
+    depts = sorted(df[df[COL_PATIENT_TYPE] == INPATIENT_VALUE][COL_DEPT_NAME]
+                   .dropna().unique().tolist())
+    rows = []
+    for dept in depts:
+        inp_count = int(
+            ((df[COL_PATIENT_TYPE] == INPATIENT_VALUE) &
+             (df[COL_DEPT_NAME] == dept)).sum()
+        )
+        res = run_ses_forecast(df, department=dept, horizon_weeks=horizon_weeks)
+        los = estimate_los(df, dept, INPATIENT_VALUE, None)
+
+        if res["success"] and not los["no_data"]:
+            bd = estimate_bed_demand(res["forecast_daily"], los["expected_los"])
+            rows.append({
+                "Department":      dept,
+                "Records":         inp_count,
+                "Forecast_Daily":  res["forecast_daily"],
+                "Expected_LOS":    los["expected_los"],
+                "Avg_Bed_Demand":  bd["avg_bed_demand"],
+                "Sufficient_Data": True,
+            })
+        else:
+            rows.append({
+                "Department":      dept,
+                "Records":         inp_count,
+                "Forecast_Daily":  None,
+                "Expected_LOS":    los["expected_los"] if not los["no_data"] else None,
+                "Avg_Bed_Demand":  None,
+                "Sufficient_Data": False,
+            })
+
+    return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Chart functions — Bed Demand Forecasting
+# ─────────────────────────────────────────────────────────────────────────────
+
+def plot_ses_forecast(
+    ses_result: dict,
+    horizon_weeks: int,
+    department_label: str = "All Departments",
+) -> go.Figure:
+    """
+    Line chart: historical weekly inpatient arrivals + SES fitted line +
+    forecast horizon with a shaded band.
+
+    Clearly distinguishes:
+      • Observed arrivals   (solid primary line)
+      • SES fitted values   (dashed teal line)
+      • Forecast           (dashed amber line, shaded band)
+    """
+    if not ses_result.get("success"):
+        return _empty_fig(
+            "Inpatient Arrival Forecast",
+            ses_result.get("reason", "Insufficient data."),
+        )
+
+    weekly_df = ses_result["weekly_df"]
+    smoothed  = ses_result["smoothed"]
+    forecast  = ses_result["forecast"]
+    alpha     = ses_result["alpha"]
+
+    # Build x-axis labels: "W1 2007", "W2 2007", …
+    hist_labels = [
+        f"W{int(r.Week)} {int(r.Year)}" for r in weekly_df.itertuples()
+    ]
+    n_hist = len(hist_labels)
+
+    # Forecast labels continue from the last historical week
+    last_year = int(weekly_df["Year"].iloc[-1])
+    last_week = int(weekly_df["Week"].iloc[-1])
+    fc_labels = []
+    w, y = last_week, last_year
+    for _ in range(horizon_weeks):
+        w += 1
+        if w > 52:
+            w, y = 1, y + 1
+        fc_labels.append(f"W{w} {y}")
+
+    all_labels = hist_labels + fc_labels
+
+    # Forecast band (±1 RMSE)
+    rmse       = ses_result["holdout_rmse"]
+    fc_val     = ses_result["forecast_weekly"]
+    fc_upper   = np.full(horizon_weeks, max(0, fc_val + rmse))
+    fc_lower   = np.full(horizon_weeks, max(0, fc_val - rmse))
+
+    fig = go.Figure()
+
+    # 1. Observed arrivals
+    fig.add_trace(go.Scatter(
+        x=hist_labels,
+        y=weekly_df["Count"].tolist(),
+        mode="lines+markers",
+        name="Observed (weekly)",
+        line=dict(color=_C_PRIMARY, width=2),
+        marker=dict(size=5, color=_C_PRIMARY),
+        hovertemplate="<b>%{x}</b><br>Observed: %{y:.0f} inpatients<extra></extra>",
+    ))
+
+    # 2. SES fitted values
+    fig.add_trace(go.Scatter(
+        x=hist_labels,
+        y=smoothed.tolist(),
+        mode="lines",
+        name=f"SES fitted (α={alpha:.2f})",
+        line=dict(color=_C_TEAL, width=1.8, dash="dot"),
+        hovertemplate="<b>%{x}</b><br>SES fitted: %{y:.1f}<extra></extra>",
+    ))
+
+    # 3. Forecast band (filled)
+    fig.add_trace(go.Scatter(
+        x=fc_labels + fc_labels[::-1],
+        y=fc_upper.tolist() + fc_lower.tolist()[::-1],
+        fill="toself",
+        fillcolor="rgba(217,119,6,0.12)",
+        line=dict(color="rgba(0,0,0,0)"),
+        showlegend=False,
+        hoverinfo="skip",
+        name="Forecast band",
+    ))
+
+    # 4. Forecast line
+    fig.add_trace(go.Scatter(
+        x=fc_labels,
+        y=forecast.tolist(),
+        mode="lines+markers",
+        name="Forecast",
+        line=dict(color=_C_AMBER, width=2.2, dash="dash"),
+        marker=dict(size=6, color=_C_AMBER, symbol="diamond"),
+        hovertemplate="<b>%{x}</b><br>Forecast: %{y:.1f} inpatients/week<extra></extra>",
+    ))
+
+    # Vertical separator between history and forecast (categorical-safe)
+    fig.add_shape(
+        type="line",
+        x0=hist_labels[-1], x1=hist_labels[-1],
+        y0=0, y1=1,
+        xref="x", yref="paper",
+        line=dict(dash="dot", color=_C_AXIS, width=1),
+    )
+    fig.add_annotation(
+        x=hist_labels[-1], y=1.0,
+        xref="x", yref="paper",
+        text="← History | Forecast →",
+        showarrow=False,
+        font=dict(size=9, color=_C_AXIS),
+        xanchor="left",
+        yanchor="bottom",
+        xshift=4,
+    )
+
+    layout = {k: v for k, v in _BASE_LAYOUT.items() if k not in ("margin", "legend")}
+    fig.update_layout(
+        **layout,
+        title_text=f"Weekly Inpatient Arrivals & SES Forecast — {department_label}",
+        xaxis=dict(
+            **_NO_GRID,
+            title="Week",
+            tickvals=all_labels[::4],
+            ticktext=all_labels[::4],
+            tickangle=-35,
+        ),
+        yaxis=dict(**_GRID_AXIS, title="Inpatient Arrivals (per week)", rangemode="tozero"),
+        legend=dict(
+            orientation="h", y=1.1, x=0,
+            font=dict(size=11, color=_C_TEXT),
+            bgcolor="rgba(0,0,0,0)",
+            bordercolor="rgba(0,0,0,0)",
+        ),
+        margin=dict(l=40, r=20, t=70, b=60),
+        height=420,
+    )
+    return fig
+
+
+def plot_bed_demand_bar(dept_table: pd.DataFrame) -> go.Figure:
+    """
+    Horizontal bar chart of estimated average bed demand by department.
+    Only departments with sufficient data are shown.
+    """
+    if dept_table.empty:
+        return _empty_fig("Estimated Avg Bed Demand by Department")
+
+    valid = dept_table.dropna(subset=["Avg_Bed_Demand"]).sort_values(
+        "Avg_Bed_Demand", ascending=True
+    )
+    if valid.empty:
+        return _empty_fig(
+            "Estimated Avg Bed Demand by Department",
+            "Insufficient data for all departments.",
+        )
+
+    fig = go.Figure(go.Bar(
+        x=valid["Avg_Bed_Demand"],
+        y=valid["Department"],
+        orientation="h",
+        marker_color=_C_TEAL,
+        text=valid["Avg_Bed_Demand"].apply(lambda v: f"{v:.1f} beds"),
+        textposition="outside",
+        customdata=valid[["Forecast_Daily", "Expected_LOS", "Records"]].values,
+        hovertemplate=(
+            "<b>%{y}</b><br>"
+            "Avg Bed Demand: %{x:.1f} beds<br>"
+            "Forecast Daily Arrivals: %{customdata[0]:.3f}/day<br>"
+            "Expected LOS: %{customdata[1]:.2f} days<br>"
+            "Historical Records: %{customdata[2]:,}<extra></extra>"
+        ),
+    ))
+
+    height = max(300, len(valid) * 50 + 80)
+    layout = {k: v for k, v in _BASE_LAYOUT.items() if k != "margin"}
+    fig.update_layout(
+        **layout,
+        title_text="Estimated Avg Bed Demand by Department",
+        xaxis=dict(**_GRID_AXIS, title="Average Beds (estimated)",
+                   range=[0, valid["Avg_Bed_Demand"].max() * 1.25]),
+        yaxis=dict(**_NO_GRID, title="", automargin=True),
+        height=height,
+        margin=dict(l=10, r=80, t=55, b=40),
+    )
+    return fig
+
+
+def plot_holdout_validation(ses_result: dict) -> go.Figure:
+    """
+    Actual vs predicted for the holdout validation period.
+    Shows how well SES fitted on the training data predicted the held-out weeks.
+    """
+    if not ses_result.get("success"):
+        return _empty_fig("Forecast Validation (Holdout)", ses_result.get("reason", ""))
+
+    weekly_df = ses_result["weekly_df"]
+    series    = weekly_df["Count"].values.astype(float)
+    n         = len(series)
+    hold_n    = ses_result["holdout_n"]
+    alpha     = ses_result["alpha"]
+    train     = series[: n - hold_n]
+    test      = series[n - hold_n :]
+
+    fitted_train = _ses_smooth(train, alpha)
+    pred_hold    = np.full(hold_n, fitted_train[-1])
+
+    hold_labels = [
+        f"W{int(r.Week)} {int(r.Year)}"
+        for r in weekly_df.tail(hold_n).itertuples()
+    ]
+    rmse = ses_result["holdout_rmse"]
+
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(
+        x=hold_labels, y=test.tolist(),
+        mode="lines+markers", name="Actual",
+        line=dict(color=_C_PRIMARY, width=2),
+        marker=dict(size=6),
+        hovertemplate="<b>%{x}</b><br>Actual: %{y:.0f} inpatients<extra></extra>",
+    ))
+    fig.add_trace(go.Scatter(
+        x=hold_labels, y=pred_hold.tolist(),
+        mode="lines+markers", name="SES Prediction",
+        line=dict(color=_C_AMBER, width=2, dash="dash"),
+        marker=dict(size=6, symbol="diamond"),
+        hovertemplate="<b>%{x}</b><br>Predicted: %{y:.1f} inpatients<extra></extra>",
+    ))
+
+    layout = {k: v for k, v in _BASE_LAYOUT.items() if k not in ("margin", "legend")}
+    fig.update_layout(
+        **layout,
+        title_text=f"Holdout Validation — Last {hold_n} Weeks (RMSE = {rmse:.2f})",
+        xaxis=dict(**_NO_GRID, title="Week", tickangle=-30),
+        yaxis=dict(**_GRID_AXIS, title="Inpatient Arrivals"),
+        legend=dict(
+            orientation="h", y=1.08, x=0,
+            font=dict(size=11, color=_C_TEXT),
+            bgcolor="rgba(0,0,0,0)", bordercolor="rgba(0,0,0,0)",
+        ),
+        margin=dict(l=40, r=20, t=70, b=50),
+    )
+    return fig
