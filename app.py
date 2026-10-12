@@ -98,6 +98,18 @@ from utils.diagnostic import (
     DIAGNOSIS_AVAILABLE,
     DIAGNOSIS_NOTE,
 )
+from utils.predictive import (
+    overall_los_stats,
+    los_by_department,
+    los_by_dept_type,
+    los_by_dept_type_age,
+    estimate_los,
+    plot_median_los_by_department,
+    plot_median_los_by_dept_type,
+    plot_los_distribution_by_type,
+    MIN_GROUP_RECORDS,
+    AGE_ORDER,
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Design tokens  (single source of truth for the healthcare colour palette)
@@ -1140,7 +1152,290 @@ def render_diagnostic_analytics():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PAGE 5 — Coming Soon helper  (Predictive Analytics)
+# PAGE 5 — Predictive Analytics  (Phase 3 — Expected LOS Prediction)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def render_predictive_analytics():
+    _page_header(
+        "🤖", "Predictive Analytics",
+        f"Phase 3 · Expected LOS Prediction · {len(filtered_df):,} records in view",
+    )
+
+    if len(filtered_df) == 0:
+        st.warning("No records match the current filters. Adjust the sidebar to see results.")
+        return
+
+    # ── Methodology notice ────────────────────────────────────
+    st.info(
+        "**Expected LOS** is estimated using the **historical median** length of stay "
+        "for comparable patient groups (department, patient type, age bucket). "
+        "The median is less affected by unusually long stays than the mean. "
+        "This is a historical baseline estimate, not a validated individual-patient prediction."
+    )
+
+    if active_filters:
+        st.caption(
+            f"Estimates are based on **{len(filtered_df):,} filtered records** "
+            f"({len(processed_df):,} total). Changing the sidebar filters updates "
+            "all values below."
+        )
+
+    # ──────────────────────────────────────────────────────────
+    # SECTION 1 — Overall KPI cards
+    # ──────────────────────────────────────────────────────────
+    st.markdown(
+        f'<div style="background:{C_PRIMARY}; color:#FFFFFF; border-radius:8px; '
+        f'padding:0.55rem 1rem; font-size:0.82rem; font-weight:700; '
+        f'letter-spacing:0.06em; margin:1.2rem 0 0.9rem 0;">'
+        f'1 &nbsp;·&nbsp; OVERALL LOS SUMMARY'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    stats = overall_los_stats(filtered_df)
+    if not stats:
+        st.warning("No valid LOS records in the current filter selection.")
+        return
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Overall Median LOS",    f"{stats['median']:.1f} days")
+    k2.metric("Valid LOS Records",     _fmt(stats["valid_count"]))
+    k3.metric("Departments Analysed",  str(stats["dept_count"]))
+    k4.metric("Mean LOS (all records)", f"{stats['mean']:.2f} days")
+
+    # ──────────────────────────────────────────────────────────
+    # SECTION 2 — Group-level selector + estimate card
+    # ──────────────────────────────────────────────────────────
+    st.markdown(
+        f'<div style="background:{C_TEAL}; color:#FFFFFF; border-radius:8px; '
+        f'padding:0.55rem 1rem; font-size:0.82rem; font-weight:700; '
+        f'letter-spacing:0.06em; margin:1.8rem 0 0.9rem 0;">'
+        f'2 &nbsp;·&nbsp; GROUP SELECTOR &amp; EXPECTED LOS'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "Narrow down to a specific patient group. The estimate falls back to a broader "
+        "grouping if the selected combination has no records."
+    )
+
+    # Build selector options from the filtered DataFrame
+    dept_opts  = ["— All Departments —"] + sorted(
+        filtered_df[COL_DEPT_NAME].dropna().unique().tolist()
+    ) if COL_DEPT_NAME in filtered_df.columns else ["— All Departments —"]
+
+    type_opts  = ["— All Types —"] + sorted(
+        filtered_df[COL_PATIENT_TYPE].dropna().unique().tolist()
+    ) if COL_PATIENT_TYPE in filtered_df.columns else ["— All Types —"]
+
+    age_present = [a for a in AGE_ORDER if a in filtered_df.get(COL_AGE_BUCKET, pd.Series()).values] \
+        if COL_AGE_BUCKET in filtered_df.columns else []
+    age_opts   = ["— All Age Groups —"] + age_present
+
+    sel_col1, sel_col2, sel_col3 = st.columns(3)
+    with sel_col1:
+        sel_dept = st.selectbox(
+            "Department", options=dept_opts,
+            index=0, key="pred_dept",
+        )
+    with sel_col2:
+        sel_type = st.selectbox(
+            "Patient Type", options=type_opts,
+            index=0, key="pred_type",
+        )
+    with sel_col3:
+        sel_age = st.selectbox(
+            "Age Bucket", options=age_opts,
+            index=0, key="pred_age",
+        )
+
+    # Resolve sentinel "all" values to None
+    dept_val = None if sel_dept.startswith("—") else sel_dept
+    type_val = None if sel_type.startswith("—") else sel_type
+    age_val  = None if sel_age.startswith("—")  else sel_age
+
+    est = estimate_los(filtered_df, dept_val, type_val, age_val)
+
+    st.markdown("<div style='margin-top:0.8rem'></div>", unsafe_allow_html=True)
+
+    if est["no_data"]:
+        st.warning(
+            "No valid LOS records found for the selected combination. "
+            "Try broader selections or adjust the sidebar filters."
+        )
+    else:
+        # Estimate card
+        conf_colour = _C_AMBER if est["low_confidence"] else C_TEAL
+        conf_label  = (
+            f"⚠ Low confidence — only {est['records']} record(s) matched. "
+            "Estimate may not be representative."
+            if est["low_confidence"]
+            else f"Based on {est['records']:,} historical records."
+        )
+        est_c1, est_c2, est_c3, est_c4 = st.columns(4)
+        est_c1.metric(
+            "Expected LOS (Median)",
+            f"{est['expected_los']:.1f} days",
+        )
+        est_c2.metric("Mean LOS (same group)", f"{est['mean_los']:.2f} days")
+        est_c3.metric("Historical Records",    _fmt(est["records"]))
+        est_c4.metric("Grouping Level Used",   est["level"].split("+")[0].strip())
+
+        st.markdown(
+            f'<div style="background:{"#FFF7ED" if est["low_confidence"] else C_ACTIVE_BG}; '
+            f'border-left:3px solid {conf_colour}; border-radius:4px; '
+            f'padding:0.45rem 0.85rem; font-size:0.8rem; color:{C_TEXT}; '
+            f'margin-bottom:0.5rem;">'
+            f'Grouping level: <strong>{est["level"]}</strong> &nbsp;·&nbsp; {conf_label}'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+
+    # ──────────────────────────────────────────────────────────
+    # SECTION 3 — Results table
+    # ──────────────────────────────────────────────────────────
+    st.markdown(
+        f'<div style="background:{C_ACCENT}; color:#FFFFFF; border-radius:8px; '
+        f'padding:0.55rem 1rem; font-size:0.82rem; font-weight:700; '
+        f'letter-spacing:0.06em; margin:1.8rem 0 0.9rem 0;">'
+        f'3 &nbsp;·&nbsp; EXPECTED LOS RESULTS TABLE'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "Expected LOS = historical median LOS for each group. "
+        f"⚠ = fewer than {MIN_GROUP_RECORDS} records — treat with caution."
+    )
+
+    # Choose table granularity based on selections
+    if age_val:
+        table_df = los_by_dept_type_age(filtered_df)
+        if not table_df.empty and dept_val:
+            table_df = table_df[table_df["Department"] == dept_val]
+        if not table_df.empty and type_val:
+            table_df = table_df[table_df["Patient Type"] == type_val]
+        if not table_df.empty and age_val:
+            table_df = table_df[table_df["Age Bucket"] == age_val]
+    else:
+        table_df = los_by_dept_type(filtered_df)
+        if not table_df.empty and dept_val:
+            table_df = table_df[table_df["Department"] == dept_val]
+        if not table_df.empty and type_val:
+            table_df = table_df[table_df["Patient Type"] == type_val]
+
+    # If selections narrowed to nothing, fall back to dept-level table
+    if table_df is None or table_df.empty:
+        table_df = los_by_department(filtered_df)
+        if not table_df.empty and dept_val:
+            table_df = table_df[table_df["Department"] == dept_val]
+
+    if table_df is None or table_df.empty:
+        st.warning("No records match the current selections for the table.")
+    else:
+        # Build display DataFrame
+        disp_cols = [c for c in [
+            "Department", "Patient Type", "Age Bucket",
+            "Median_LOS", "Mean_LOS", "Min_LOS", "Max_LOS", "Records",
+        ] if c in table_df.columns]
+        disp = table_df[disp_cols].copy()
+        disp = disp.rename(columns={
+            "Median_LOS": "Expected LOS (Median, days)",
+            "Mean_LOS":   "Mean LOS (days)",
+            "Min_LOS":    "Min LOS (days)",
+            "Max_LOS":    "Max LOS (days)",
+        })
+
+        # Flag low-confidence rows with ⚠ suffix in Records column
+        if "Low_Confidence" in table_df.columns:
+            lc_mask = table_df["Low_Confidence"].values
+            disp["Records"] = [
+                f"{r} ⚠" if lc else str(r)
+                for r, lc in zip(disp["Records"], lc_mask)
+            ]
+
+        st.dataframe(disp, use_container_width=True, hide_index=True)
+
+    # ──────────────────────────────────────────────────────────
+    # SECTION 4 — Charts
+    # ──────────────────────────────────────────────────────────
+    st.markdown(
+        f'<div style="background:#475569; color:#FFFFFF; border-radius:8px; '
+        f'padding:0.55rem 1rem; font-size:0.82rem; font-weight:700; '
+        f'letter-spacing:0.06em; margin:1.8rem 0 0.9rem 0;">'
+        f'4 &nbsp;·&nbsp; VISUALISATIONS'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    # Row 1 — Median LOS by Department + by Dept & Type
+    _section("Median LOS by Department")
+    v1, v2 = st.columns(2)
+    with v1:
+        st.plotly_chart(
+            plot_median_los_by_department(filtered_df),
+            use_container_width=True,
+        )
+    with v2:
+        st.plotly_chart(
+            plot_median_los_by_dept_type(filtered_df),
+            use_container_width=True,
+        )
+
+    st.markdown("")
+
+    # Row 2 — LOS distribution (half width)
+    _section("LOS Distribution by Patient Type")
+    v3, _ = st.columns(2)
+    with v3:
+        st.plotly_chart(
+            plot_los_distribution_by_type(filtered_df),
+            use_container_width=True,
+        )
+
+    # ──────────────────────────────────────────────────────────
+    # SECTION 5 — Bed Demand Forecasting placeholder
+    # ──────────────────────────────────────────────────────────
+    st.markdown(
+        f'<div style="background:#94A3B8; color:#FFFFFF; border-radius:8px; '
+        f'padding:0.55rem 1rem; font-size:0.82rem; font-weight:700; '
+        f'letter-spacing:0.06em; margin:2rem 0 0.9rem 0;">'
+        f'5 &nbsp;·&nbsp; BED DEMAND FORECASTING &nbsp;— COMING SOON'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        f'<div style="background:{C_CARD}; border:1px dashed {C_BORDER}; '
+        f'border-radius:10px; padding:2rem; text-align:center;">'
+        f'<div style="font-size:2rem; margin-bottom:0.5rem;">🛏</div>'
+        f'<p style="font-size:1rem; font-weight:700; color:{C_PRIMARY}; margin:0 0 0.3rem 0;">'
+        f'Bed Demand Forecasting</p>'
+        f'<p style="font-size:0.85rem; color:{C_SUBTEXT}; margin:0;">'
+        f'Planned feature — will model expected bed occupancy using admission '
+        f'patterns and predicted LOS from historical records.</p>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    # ──────────────────────────────────────────────────────────
+    # Footer methodology note
+    # ──────────────────────────────────────────────────────────
+    st.markdown(
+        f'<p style="font-size:0.75rem; color:{C_SUBTEXT}; margin-top:1.8rem; '
+        f'border-top:1px solid {C_BORDER}; padding-top:0.6rem;">'
+        f'<strong>Methodology:</strong> Expected LOS is estimated using the historical '
+        f'median length of stay for comparable patient groups. '
+        f'The median is less affected by unusually long stays than the mean. '
+        f'This is a historical baseline estimate, not a validated individual-patient '
+        f'prediction. No machine-learning model was trained. '
+        f'Source data: <code>{os.path.basename(DATA_PATH)}</code>. '
+        f'Original file is never modified.'
+        f'</p>',
+        unsafe_allow_html=True,
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# PAGE — Coming Soon helper  (retained for future pages)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def render_coming_soon(title: str, icon: str, phase: str, features: list[str]):
@@ -1185,15 +1480,7 @@ elif selected_page == NAV_ITEMS[3]:
     render_diagnostic_analytics()
 
 elif selected_page == NAV_ITEMS[4]:
-    render_coming_soon(
-        title="Predictive Analytics",
-        icon="🤖",
-        phase="Phase 4",
-        features=[
-            "Expected LOS prediction",
-            "Bed demand forecasting"
-        ],
-    )
+    render_predictive_analytics()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Footer
@@ -1202,7 +1489,7 @@ elif selected_page == NAV_ITEMS[4]:
 st.markdown(f'<hr style="border:none; border-top:1px solid {C_BORDER}; margin:2rem 0 0.5rem 0;">', unsafe_allow_html=True)
 st.markdown(
     f'<p style="font-size:0.72rem; color:{C_SUBTEXT}; text-align:center;">'
-    f'MediSight · Phase 1 + Phase 2 · Data: <code>{os.path.basename(DATA_PATH)}</code> · '
+    f'MediSight · Phase 1 + Phase 2 + Phase 3 · Data: <code>{os.path.basename(DATA_PATH)}</code> · '
     f'No data generated, modified, or written back to source.'
     f'</p>',
     unsafe_allow_html=True,
