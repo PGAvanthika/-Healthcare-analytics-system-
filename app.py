@@ -514,13 +514,55 @@ with st.sidebar:
         key="type_filter",
     )
 
-    # Additional filters — Phase 3+
-    with st.expander("More filters — Phase 3+", expanded=False):
-        st.caption("Gender, Age Group, Status, City filters — planned for a future phase.")
-        st.multiselect("Gender",    options=[], disabled=True, key="gender_ph")
-        st.multiselect("Age Group", options=[], disabled=True, key="age_ph")
-        st.multiselect("Status",    options=[], disabled=True, key="status_ph")
-        st.multiselect("City",      options=[], disabled=True, key="city_ph")
+    # Gender
+    if COL_GENDER in processed_df.columns:
+        gender_options   = sorted(processed_df[COL_GENDER].dropna().unique().tolist())
+        selected_genders = st.multiselect(
+            "Gender",
+            options=gender_options, default=[],
+            placeholder="All genders",
+            key="gender_filter",
+        )
+    else:
+        selected_genders = []
+
+    # Age Group
+    _age_order_full = ["Below 6Y", "6-20Y", "21-40Y", "41-60y", "60+Y"]
+    if COL_AGE_BUCKET in processed_df.columns:
+        _present_ages  = [a for a in _age_order_full
+                          if a in processed_df[COL_AGE_BUCKET].dropna().values]
+        selected_ages  = st.multiselect(
+            "Age Group",
+            options=_present_ages, default=[],
+            placeholder="All age groups",
+            key="age_filter",
+        )
+    else:
+        selected_ages = []
+
+    # Status
+    if COL_STATUS in processed_df.columns:
+        status_options   = sorted(processed_df[COL_STATUS].dropna().unique().tolist())
+        selected_statuses = st.multiselect(
+            "Status",
+            options=status_options, default=[],
+            placeholder="All statuses",
+            key="status_filter",
+        )
+    else:
+        selected_statuses = []
+
+    # City
+    if COL_CITY in processed_df.columns:
+        city_options   = sorted(processed_df[COL_CITY].dropna().unique().tolist())
+        selected_cities = st.multiselect(
+            "City",
+            options=city_options, default=[],
+            placeholder="All cities",
+            key="city_filter",
+        )
+    else:
+        selected_cities = []
 
     st.markdown(f'<hr style="border:none; border-top:1px solid {C_BORDER}; margin:0.8rem 0;">', unsafe_allow_html=True)
 
@@ -554,6 +596,18 @@ if selected_depts and COL_DEPT_NAME in filtered_df.columns:
 if selected_types and COL_PATIENT_TYPE in filtered_df.columns:
     filtered_df = filtered_df[filtered_df[COL_PATIENT_TYPE].isin(selected_types)]
 
+if selected_genders and COL_GENDER in filtered_df.columns:
+    filtered_df = filtered_df[filtered_df[COL_GENDER].isin(selected_genders)]
+
+if selected_ages and COL_AGE_BUCKET in filtered_df.columns:
+    filtered_df = filtered_df[filtered_df[COL_AGE_BUCKET].isin(selected_ages)]
+
+if selected_statuses and COL_STATUS in filtered_df.columns:
+    filtered_df = filtered_df[filtered_df[COL_STATUS].isin(selected_statuses)]
+
+if selected_cities and COL_CITY in filtered_df.columns:
+    filtered_df = filtered_df[filtered_df[COL_CITY].isin(selected_cities)]
+
 # Build active-filter description for banners
 active_filters: list[str] = []
 if date_from != min_date or date_to != max_date:
@@ -562,6 +616,14 @@ if selected_depts:
     active_filters.append(f"Dept: {', '.join(selected_depts)}")
 if selected_types:
     active_filters.append(f"Type: {', '.join(selected_types)}")
+if selected_genders:
+    active_filters.append(f"Gender: {', '.join(selected_genders)}")
+if selected_ages:
+    active_filters.append(f"Age: {', '.join(selected_ages)}")
+if selected_statuses:
+    active_filters.append(f"Status: {', '.join(selected_statuses)}")
+if selected_cities:
+    active_filters.append(f"City: {', '.join(selected_cities)}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
