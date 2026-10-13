@@ -482,6 +482,15 @@ with st.sidebar:
         key="date_to",
     )
 
+    # Date validation: From must be ≤ To
+    if date_from > date_to:
+        st.error(
+            f"⚠ 'From' ({date_from}) is later than 'To' ({date_to}). "
+            "Please correct the date range."
+        )
+        # Swap silently so the rest of the app still renders
+        date_from, date_to = date_to, date_from
+
     st.markdown("<div style='margin-top:0.5rem'></div>", unsafe_allow_html=True)
 
     # Department
@@ -505,9 +514,9 @@ with st.sidebar:
         key="type_filter",
     )
 
-    # Phase 2+ placeholders
-    with st.expander("More filters — Phase 2", expanded=False):
-        st.caption("Gender, Age Group, Status, City — coming in Phase 2.")
+    # Additional filters — Phase 3+
+    with st.expander("More filters — Phase 3+", expanded=False):
+        st.caption("Gender, Age Group, Status, City filters — planned for a future phase.")
         st.multiselect("Gender",    options=[], disabled=True, key="gender_ph")
         st.multiselect("Age Group", options=[], disabled=True, key="age_ph")
         st.multiselect("Status",    options=[], disabled=True, key="status_ph")
@@ -1532,13 +1541,31 @@ def render_predictive_analytics():
                 "The arrival forecast is still shown below."
             )
 
-        # Model parameters
+        # Model parameters + accuracy metrics + baseline comparison
         st.markdown(
             f'<div style="font-size:0.76rem; color:{C_SUBTEXT}; margin-bottom:0.8rem;">'
-            f'SES alpha (optimised): <strong>{ses_result["alpha"]:.2f}</strong> &nbsp;·&nbsp; '
-            f'Holdout RMSE: <strong>{ses_result["holdout_rmse"]:.2f} inpatients/week</strong> '
-            f'(last {ses_result["holdout_n"]} weeks) &nbsp;·&nbsp; '
-            f'Historical observations: <strong>{ses_result["n_obs"]} weeks</strong>'
+            f'SES alpha (optimised): <strong>{ses_result["alpha"]:.2f}</strong>'
+            f' &nbsp;·&nbsp; '
+            f'Holdout RMSE: <strong>{ses_result["holdout_rmse"]:.2f}</strong> inpatients/week'
+            f' &nbsp;·&nbsp; '
+            f'Holdout MAE: <strong>{ses_result["holdout_mae"]:.2f}</strong> inpatients/week'
+            f' &nbsp;·&nbsp; '
+            f'Holdout period: last <strong>{ses_result["holdout_n"]}</strong> of '
+            f'<strong>{ses_result["n_obs"]}</strong> weeks'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+        # Baseline comparison
+        ses_better_naive = ses_result["holdout_rmse"] <= ses_result["naive_rmse"]
+        ses_better_mean  = ses_result["holdout_rmse"] <= ses_result["mean_rmse"]
+        st.markdown(
+            f'<div style="font-size:0.75rem; color:{C_SUBTEXT}; margin-bottom:0.9rem;">'
+            f'Baseline comparison (holdout) &nbsp;·&nbsp; '
+            f'Naïve (last obs): RMSE={ses_result["naive_rmse"]:.2f}, MAE={ses_result["naive_mae"]:.2f} '
+            f'{"✓ SES better" if ses_better_naive else "⚠ SES worse"}'
+            f' &nbsp;·&nbsp; '
+            f'Historical mean: RMSE={ses_result["mean_rmse"]:.2f}, MAE={ses_result["mean_mae"]:.2f} '
+            f'{"✓ SES better" if ses_better_mean else "⚠ SES worse"}'
             f'</div>',
             unsafe_allow_html=True,
         )
@@ -1615,9 +1642,17 @@ S(t) = α × Y(t) + (1 − α) × S(t−1)
 - All h-step-ahead SES forecasts equal the last smoothed level (flat/constant)
 - SES does not model trend or seasonality — stated limitation
 
+**Accuracy metrics (holdout validation)**
+
+- RMSE = √(mean((actual − predicted)²)) — penalises large errors more
+- MAE = mean(|actual − predicted|) — average absolute error
+- Compared against naïve baseline (last observed value) and historical mean
+
 **Bed demand approximation (steady-flow)**
 
 Average Bed Demand ≈ Forecast Daily Arrivals × Expected LOS (days)
+
+Daily arrivals = Weekly forecast ÷ 7
 
 Valid when admission and discharge rates are in approximate steady state.
 Represents **average** occupancy, not daily peak or guaranteed capacity.
@@ -1628,7 +1663,7 @@ Represents **average** occupancy, not daily peak or guaranteed capacity.
   (patient_id, date) pair across {len(processed_df):,} records
 - Only `{INPATIENT_VALUE}` records contribute to arrival counts
 - Weekly aggregation used (52 observations in full dataset, 0 zero-weeks)
-- Expected LOS reused from Feature 1 (historical median, same filters)
+- Expected LOS reused from Feature 1 (historical median — inpatient group)
 
 **Limitations**
 

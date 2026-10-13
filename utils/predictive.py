@@ -241,7 +241,8 @@ def estimate_los(
         1. Department + Patient type + Age Bucket  (if all provided)
         2. Department + Patient type               (if dept + type provided)
         3. Department only                         (if only dept provided)
-        4. Overall median                          (final fallback)
+        4. Patient type only                       (if only type provided)
+        5. Overall median                          (final fallback)
 
     Returns
     -------
@@ -273,6 +274,11 @@ def estimate_los(
                          "Department + Patient Type"))
     if department:
         attempts.append((department, None, None, "Department"))
+    # FIX: add patient-type-only level so type='Inpatient' without a dept
+    # uses only inpatient records instead of silently falling to Overall.
+    if patient_type:
+        attempts.append((None, patient_type, None,
+                         f"Patient Type ({patient_type})"))
     attempts.append((None, None, None, "Overall (all records)"))
 
     for dept, ptype, age, level in attempts:
@@ -741,6 +747,23 @@ def run_ses_forecast(
     forecast = _ses_forecast(series, alpha, horizon_weeks)
 
     hold_n = max(4, len(series) // 5)
+    n      = len(series)
+
+    # Compute holdout MAE and baseline comparisons (no future leakage)
+    train       = series[: n - hold_n]
+    test        = series[n - hold_n :]
+    ses_pred    = np.full(hold_n, _ses_smooth(train, alpha)[-1])
+    hold_mae    = float(np.mean(np.abs(test - ses_pred)))
+
+    # Naive baseline: last observed value
+    naive_pred  = np.full(hold_n, series[n - hold_n - 1])
+    naive_rmse  = float(np.sqrt(np.mean((test - naive_pred) ** 2)))
+    naive_mae   = float(np.mean(np.abs(test - naive_pred)))
+
+    # Historical mean baseline: mean of training window
+    mean_pred   = np.full(hold_n, train.mean())
+    mean_rmse   = float(np.sqrt(np.mean((test - mean_pred) ** 2)))
+    mean_mae    = float(np.mean(np.abs(test - mean_pred)))
 
     return {
         "success":         True,
@@ -748,12 +771,18 @@ def run_ses_forecast(
         "weekly_df":       weekly_df,
         "alpha":           alpha,
         "holdout_rmse":    round(hold_rmse, 2),
+        "holdout_mae":     round(hold_mae, 2),
         "holdout_n":       hold_n,
         "smoothed":        smoothed,
         "forecast":        forecast,
         "forecast_weekly": round(float(forecast[0]), 2),
         "forecast_daily":  round(float(forecast[0]) / 7.0, 4),
         "n_obs":           len(series),
+        # Baseline comparisons
+        "naive_rmse":      round(naive_rmse, 2),
+        "naive_mae":       round(naive_mae, 2),
+        "mean_rmse":       round(mean_rmse, 2),
+        "mean_mae":        round(mean_mae, 2),
     }
 
 
